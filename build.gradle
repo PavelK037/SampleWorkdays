@@ -1,6 +1,7 @@
 plugins {
     id 'java'
     id 'groovy'
+    id 'application'
 }
 
 group = 'com.ciena.workday'

@@ -11,6 +11,7 @@ build/
 .classpath
 .project
 .settings/
+.class
 
 # OS
 .DS_Store

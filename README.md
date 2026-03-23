@@ -22,3 +22,5 @@ Console application that calculates a future date after a given number of **busi
 
 # With holidays
 # Just make sure holidays.json is present and valid
+
+# PavelK comments March 22, 2026

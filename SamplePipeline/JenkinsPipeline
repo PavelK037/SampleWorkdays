@@ -1,0 +1,545 @@
+// ============================================================
+//  Jenkins Declarative Pipeline
+//  Java Microservice — Build, Test, Dockerize, Helm, Deploy
+//  Target: OpenShift / Kubernetes (Test Environment x2 pods)
+// ============================================================
+
+pipeline {
+
+    // ── Agent ────────────────────────────────────────────────
+    agent {
+        kubernetes {
+            label 'java-ms-builder'
+            defaultContainer 'jnlp'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-sa       # SA with registry + k8s permissions
+  containers:
+    - name: maven
+      image: maven:3.9.4-eclipse-temurin-17
+      command: [cat]
+      tty: true
+      volumeMounts:
+        - name: maven-cache
+          mountPath: /root/.m2
+
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true               # required for Docker-in-Docker
+      volumeMounts:
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+
+    - name: helm
+      image: alpine/helm:3.13.0
+      command: [cat]
+      tty: true
+
+    - name: kubectl
+      image: bitnami/kubectl:1.28
+      command: [cat]
+      tty: true
+
+  volumes:
+    - name: maven-cache
+      persistentVolumeClaim:
+        claimName: maven-cache-pvc
+    - name: docker-sock
+      hostPath:
+        path: /var/run/docker.sock
+"""
+        }
+    }
+
+    // ── Trigger ───────────────────────────────────────────────
+    triggers {
+        // Poll SCM every minute — or use GitHub/GitLab webhook
+        // Webhook is preferred: configure in repo settings →
+        // POST to http://<JENKINS_URL>/github-webhook/
+        pollSCM('* * * * *')
+    }
+
+    // ── Global Environment ────────────────────────────────────
+    environment {
+        // --- Source ---
+        GIT_REPO          = 'https://gitlab.internal/myorg/java-microservice.git'
+        GIT_BRANCH        = 'dev'
+
+        // --- App ---
+        APP_NAME          = 'java-microservice'
+        APP_VERSION       = sh(script: "mvn help:evaluate -Dexpression=project.version -q -DforceStdout 2>/dev/null || echo '1.0.0'", returnStdout: true).trim()
+
+        // --- Docker / Registry ---
+        REGISTRY_URL      = 'registry.marketplace.internal'
+        REGISTRY_REPO     = "${REGISTRY_URL}/myorg/${APP_NAME}"
+        IMAGE_TAG         = "${APP_VERSION}-${BUILD_NUMBER}"
+        FULL_IMAGE        = "${REGISTRY_REPO}:${IMAGE_TAG}"
+
+        // --- Helm ---
+        HELM_CHART_DIR    = 'helm/java-microservice'
+        HELM_RELEASE      = "${APP_NAME}-test"
+        HELM_NAMESPACE    = 'test'
+
+        // --- Kubernetes / OpenShift ---
+        K8S_NAMESPACE     = 'test'
+        REPLICA_COUNT     = '2'                      // 2 containers on test env
+        KUBECONFIG_ID     = 'kubeconfig-openshift'   // Jenkins credential ID
+
+        // --- Credentials (stored in Jenkins Credentials Store) ---
+        REGISTRY_CRED_ID  = 'marketplace-registry-credentials'
+        SONAR_TOKEN_ID    = 'sonarqube-token'
+    }
+
+    // ── Pipeline Options ──────────────────────────────────────
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()                    // prevent parallel runs on dev
+    }
+
+    // ============================================================
+    //  S T A G E S
+    // ============================================================
+    stages {
+
+        // ── 0. Checkout ──────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                echo "╔══════════════════════════════════╗"
+                echo "║  Checkout: ${GIT_BRANCH} branch  ║"
+                echo "╚══════════════════════════════════╝"
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${GIT_BRANCH}"]],
+                    userRemoteConfigs: [[
+                        url: "${GIT_REPO}",
+                        credentialsId: 'gitlab-credentials'
+                    ]]
+                ])
+                // Print commit info for traceability
+                sh '''
+                    echo "Commit : $(git rev-parse --short HEAD)"
+                    echo "Author : $(git log -1 --format='%an <%ae>')"
+                    echo "Message: $(git log -1 --format='%s')"
+                '''
+            }
+        }
+
+        // ── 1. Build ─────────────────────────────────────────
+        stage('Build') {
+            steps {
+                echo "╔══════════════════════════╗"
+                echo "║  Maven Build & Compile   ║"
+                echo "╚══════════════════════════╝"
+                container('maven') {
+                    sh '''
+                        mvn clean package \
+                            -DskipTests \
+                            -Dmaven.repo.local=/root/.m2/repository \
+                            --batch-mode \
+                            --no-transfer-progress
+                    '''
+                }
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                }
+            }
+        }
+
+        // ── 2. Unit + Integration Tests ───────────────────────
+        stage('Test') {
+            parallel {
+
+                stage('Unit Tests') {
+                    steps {
+                        container('maven') {
+                            sh '''
+                                mvn test \
+                                    -Dmaven.repo.local=/root/.m2/repository \
+                                    --batch-mode \
+                                    --no-transfer-progress
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            junit 'target/surefire-reports/**/*.xml'
+                            jacoco(
+                                execPattern: 'target/jacoco.exec',
+                                classPattern: 'target/classes',
+                                sourcePattern: 'src/main/java',
+                                minimumInstructionCoverage: '70'   // fail if < 70%
+                            )
+                        }
+                    }
+                }
+
+                stage('Integration Tests') {
+                    steps {
+                        container('maven') {
+                            sh '''
+                                mvn verify \
+                                    -P integration-tests \
+                                    -Dmaven.repo.local=/root/.m2/repository \
+                                    --batch-mode \
+                                    --no-transfer-progress
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            junit 'target/failsafe-reports/**/*.xml'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 3. SonarQube Quality Gate ─────────────────────────
+        stage('Code Quality') {
+            steps {
+                container('maven') {
+                    withSonarQubeEnv('SonarQube') {
+                        sh '''
+                            mvn sonar:sonar \
+                                -Dsonar.projectKey=${APP_NAME} \
+                                -Dsonar.projectName="${APP_NAME}" \
+                                -Dsonar.java.coveragePlugin=jacoco \
+                                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+                                --batch-mode
+                        '''
+                    }
+                    // Block pipeline until SonarQube analysis is complete
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        // Print dashboard URL for traceability
+                        def props = readProperties file: '.scannerwork/report-task.txt'
+                        echo "SonarQube Dashboard: ${props['dashboardUrl']}"
+                    }
+                }
+            }
+        }
+
+        // ── 4. Docker Build & Push to Marketplace Registry ────
+        stage('Docker Build & Push') {
+            steps {
+                echo "╔══════════════════════════════════════╗"
+                echo "║  Building Docker Image: ${IMAGE_TAG}  ║"
+                echo "╚══════════════════════════════════════╝"
+                container('docker') {
+                    withCredentials([usernamePassword(
+                        credentialsId: "${REGISTRY_CRED_ID}",
+                        usernameVariable: 'REG_USER',
+                        passwordVariable: 'REG_PASS'
+                    )]) {
+                        sh '''
+                            # ── Login to proprietary Marketplace Registry
+                            echo "${REG_PASS}" | docker login ${REGISTRY_URL} \
+                                -u "${REG_USER}" --password-stdin
+
+                            # ── Build with build-args for traceability
+                            docker build \
+                                --build-arg APP_VERSION=${APP_VERSION} \
+                                --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
+                                --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) \
+                                --label "build.number=${BUILD_NUMBER}" \
+                                --label "git.branch=${GIT_BRANCH}" \
+                                --cache-from ${REGISTRY_REPO}:latest \
+                                -t ${FULL_IMAGE} \
+                                -t ${REGISTRY_REPO}:latest \
+                                .
+
+                            # ── Security scan before push
+                            echo "Running Trivy vulnerability scan..."
+                            docker run --rm \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                aquasec/trivy:latest image \
+                                --exit-code 0 \
+                                --severity HIGH,CRITICAL \
+                                --no-progress \
+                                ${FULL_IMAGE}
+
+                            # ── Push versioned tag + latest
+                            docker push ${FULL_IMAGE}
+                            docker push ${REGISTRY_REPO}:latest
+
+                            echo "✅ Image pushed: ${FULL_IMAGE}"
+
+                            # ── Cleanup local images
+                            docker rmi ${FULL_IMAGE} || true
+                            docker rmi ${REGISTRY_REPO}:latest || true
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ── 5. Helm Chart — Resolve Dependencies & Package ────
+        stage('Helm Package') {
+            steps {
+                echo "╔══════════════════════════╗"
+                echo "║  Helm Dependency Update  ║"
+                echo "╚══════════════════════════╝"
+                container('helm') {
+                    sh '''
+                        # ── Resolve all chart dependencies (subcharts)
+                        helm dependency update ${HELM_CHART_DIR}
+
+                        # ── Lint the chart — catch config errors early
+                        helm lint ${HELM_CHART_DIR} \
+                            --set image.repository=${REGISTRY_REPO} \
+                            --set image.tag=${IMAGE_TAG} \
+                            --set replicaCount=${REPLICA_COUNT}
+
+                        # ── Package into .tgz for artifact storage
+                        helm package ${HELM_CHART_DIR} \
+                            --version ${APP_VERSION} \
+                            --app-version ${APP_VERSION} \
+                            --destination ./helm-output/
+
+                        echo "✅ Helm chart packaged:"
+                        ls -lh ./helm-output/
+                    '''
+                    archiveArtifacts artifacts: 'helm-output/*.tgz', fingerprint: true
+                }
+            }
+        }
+
+        // ── 6. Deploy to Kubernetes / OpenShift Test Env ──────
+        stage('Deploy to Test (OpenShift)') {
+            steps {
+                echo "╔══════════════════════════════════════════╗"
+                echo "║  Deploying to OpenShift Test Environment ║"
+                echo "║  Replicas: ${REPLICA_COUNT} containers   ║"
+                echo "╚══════════════════════════════════════════╝"
+                container('helm') {
+                    withCredentials([file(
+                        credentialsId: "${KUBECONFIG_ID}",
+                        variable: 'KUBECONFIG'
+                    )]) {
+                        sh '''
+                            export KUBECONFIG=${KUBECONFIG}
+
+                            # ── Ensure namespace exists
+                            kubectl get namespace ${K8S_NAMESPACE} \
+                                || kubectl create namespace ${K8S_NAMESPACE}
+
+                            # ── Create/update registry pull secret in namespace
+                            kubectl create secret docker-registry marketplace-registry-secret \
+                                --docker-server=${REGISTRY_URL} \
+                                --docker-username=${REG_USER} \
+                                --docker-password=${REG_PASS} \
+                                --namespace=${K8S_NAMESPACE} \
+                                --dry-run=client -o yaml | kubectl apply -f -
+
+                            # ── Helm upgrade (or install if first time)
+                            helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_DIR} \
+                                --namespace ${K8S_NAMESPACE} \
+                                --set image.repository=${REGISTRY_REPO} \
+                                --set image.tag=${IMAGE_TAG} \
+                                --set replicaCount=${REPLICA_COUNT} \
+                                --set imagePullSecrets[0].name=marketplace-registry-secret \
+                                --set deployment.restartPolicy=Always \
+                                --values helm/${APP_NAME}/values-test.yaml \
+                                --wait \
+                                --timeout 10m \
+                                --atomic                     # auto-rollback on failure
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ── 7. Run OpenShift Playbook (Ansible) ───────────────
+        stage('OpenShift Ansible Playbook') {
+            steps {
+                echo "╔══════════════════════════════════╗"
+                echo "║  Running OpenShift Playbook      ║"
+                echo "╚══════════════════════════════════╝"
+                withCredentials([file(
+                    credentialsId: "${KUBECONFIG_ID}",
+                    variable: 'KUBECONFIG'
+                )]) {
+                    sh '''
+                        # Run the OpenShift Ansible playbook
+                        # Assumes ansible + openshift collection installed on agent
+                        ansible-playbook \
+                            playbooks/openshift-test-deploy.yml \
+                            -i inventory/test \
+                            --extra-vars "app_name=${APP_NAME}" \
+                            --extra-vars "image_tag=${IMAGE_TAG}" \
+                            --extra-vars "namespace=${K8S_NAMESPACE}" \
+                            --extra-vars "replica_count=${REPLICA_COUNT}" \
+                            --extra-vars "registry_url=${REGISTRY_URL}" \
+                            -v
+                    '''
+                }
+            }
+        }
+
+        // ── 8. Configure Kubernetes Restart Policy ────────────
+        stage('Configure Self-Healing (Restart on Crash)') {
+            steps {
+                echo "╔════════════════════════════════════════╗"
+                echo "║  Applying restartPolicy + liveness     ║"
+                echo "║  probes for auto-restart on crash      ║"
+                echo "╚════════════════════════════════════════╝"
+                container('kubectl') {
+                    withCredentials([file(
+                        credentialsId: "${KUBECONFIG_ID}",
+                        variable: 'KUBECONFIG'
+                    )]) {
+                        sh '''
+                            export KUBECONFIG=${KUBECONFIG}
+
+                            # ── Patch deployment with restart policy + probes
+                            kubectl patch deployment ${APP_NAME} \
+                                -n ${K8S_NAMESPACE} \
+                                --type=json \
+                                -p='[
+                                    {
+                                        "op": "replace",
+                                        "path": "/spec/template/spec/restartPolicy",
+                                        "value": "Always"
+                                    },
+                                    {
+                                        "op": "add",
+                                        "path": "/spec/template/spec/containers/0/livenessProbe",
+                                        "value": {
+                                            "httpGet": {
+                                                "path": "/actuator/health/liveness",
+                                                "port": 8080
+                                            },
+                                            "initialDelaySeconds": 30,
+                                            "periodSeconds": 10,
+                                            "failureThreshold": 3
+                                        }
+                                    },
+                                    {
+                                        "op": "add",
+                                        "path": "/spec/template/spec/containers/0/readinessProbe",
+                                        "value": {
+                                            "httpGet": {
+                                                "path": "/actuator/health/readiness",
+                                                "port": 8080
+                                            },
+                                            "initialDelaySeconds": 20,
+                                            "periodSeconds": 5,
+                                            "failureThreshold": 3
+                                        }
+                                    }
+                                ]'
+
+                            echo "✅ Restart policy and health probes applied"
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ── 9. Smoke Test ─────────────────────────────────────
+        stage('Smoke Test') {
+            steps {
+                container('kubectl') {
+                    withCredentials([file(
+                        credentialsId: "${KUBECONFIG_ID}",
+                        variable: 'KUBECONFIG'
+                    )]) {
+                        sh '''
+                            export KUBECONFIG=${KUBECONFIG}
+
+                            # ── Wait for both replicas to be ready
+                            kubectl rollout status deployment/${APP_NAME} \
+                                -n ${K8S_NAMESPACE} \
+                                --timeout=5m
+
+                            # ── Confirm 2 pods are running
+                            RUNNING=$(kubectl get pods -n ${K8S_NAMESPACE} \
+                                -l app=${APP_NAME} \
+                                --field-selector=status.phase=Running \
+                                --no-headers | wc -l)
+
+                            echo "Running pods: ${RUNNING} / ${REPLICA_COUNT}"
+
+                            if [ "${RUNNING}" -lt "${REPLICA_COUNT}" ]; then
+                                echo "❌ Expected ${REPLICA_COUNT} pods, got ${RUNNING}"
+                                kubectl describe pods -n ${K8S_NAMESPACE} -l app=${APP_NAME}
+                                exit 1
+                            fi
+
+                            echo "✅ Smoke test passed — ${RUNNING} pods running"
+
+                            # ── Print final deployment summary
+                            echo ""
+                            echo "══════════════════════════════════════════════"
+                            echo "  DEPLOYMENT SUMMARY"
+                            echo "══════════════════════════════════════════════"
+                            echo "  App       : ${APP_NAME}"
+                            echo "  Version   : ${APP_VERSION}"
+                            echo "  Image     : ${FULL_IMAGE}"
+                            echo "  Namespace : ${K8S_NAMESPACE}"
+                            echo "  Replicas  : ${RUNNING}/${REPLICA_COUNT}"
+                            echo "  Release   : ${HELM_RELEASE}"
+                            echo "══════════════════════════════════════════════"
+
+                            kubectl get pods -n ${K8S_NAMESPACE} -l app=${APP_NAME} -o wide
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    //  P O S T   A C T I O N S
+    // ============================================================
+    post {
+
+        success {
+            echo "✅ Pipeline SUCCESS — ${APP_NAME}:${IMAGE_TAG} deployed to test"
+            // Notify Slack / Teams / Email on success
+            // slackSend channel: '#deployments', color: 'good',
+            //   message: "✅ ${APP_NAME} ${IMAGE_TAG} deployed to TEST"
+        }
+
+        failure {
+            echo "❌ Pipeline FAILED — initiating rollback"
+            container('helm') {
+                withCredentials([file(
+                    credentialsId: "${KUBECONFIG_ID}",
+                    variable: 'KUBECONFIG'
+                )]) {
+                    sh '''
+                        export KUBECONFIG=${KUBECONFIG}
+                        # Helm atomic handles rollback automatically,
+                        # but this ensures it explicitly on any post-failure
+                        helm rollback ${HELM_RELEASE} 0 \
+                            --namespace ${K8S_NAMESPACE} \
+                            --wait || true
+                        echo "⏪ Rollback completed"
+                    '''
+                }
+            }
+            // slackSend channel: '#deployments', color: 'danger',
+            //   message: "❌ ${APP_NAME} pipeline FAILED — rolled back"
+        }
+
+        always {
+            // Clean workspace to free agent disk
+            cleanWs()
+        }
+    }
+}

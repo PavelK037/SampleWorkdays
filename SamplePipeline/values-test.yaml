@@ -1,0 +1,63 @@
+# helm/java-microservice/values-test.yaml
+# ── Overrides for TEST environment ──────────────────────────
+
+replicaCount: 2                          # 2 containers on test env
+
+image:
+  repository: registry.marketplace.internal/myorg/java-microservice
+  tag: latest                            # overridden by pipeline --set
+  pullPolicy: Always                     # always pull fresh from registry
+
+imagePullSecrets:
+  - name: marketplace-registry-secret    # created by pipeline
+
+deployment:
+  restartPolicy: Always                  # restart container if crashed
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+  limits:
+    cpu: "1000m"
+    memory: "1Gi"
+
+# ── Liveness Probe — restart container if unhealthy ──────────
+livenessProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3                    # restart after 3 consecutive failures
+
+# ── Readiness Probe — stop traffic until ready ───────────────
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness
+    port: 8080
+  initialDelaySeconds: 20
+  periodSeconds: 5
+  failureThreshold: 3
+
+# ── Environment ───────────────────────────────────────────────
+env:
+  - name: SPRING_PROFILES_ACTIVE
+    value: "test"
+  - name: JAVA_OPTS
+    value: "-Xms256m -Xmx768m -XX:+UseG1GC"
+
+# ── Chart Dependencies (Chart.yaml) ──────────────────────────
+# dependencies:
+#   - name: postgresql
+#     version: "12.x.x"
+#     repository: https://charts.bitnami.com/bitnami
+#     condition: postgresql.enabled
+#   - name: redis
+#     version: "17.x.x"
+#     repository: https://charts.bitnami.com/bitnami
+#     condition: redis.enabled

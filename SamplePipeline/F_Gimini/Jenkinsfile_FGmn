@@ -1,0 +1,90 @@
+pipeline {
+    agent any
+    
+    environment {
+        // Definitions for reusability
+        REGISTRY_URL = "marketplace.company.com"
+        IMAGE_NAME   = "java-microservice"
+        APP_NAME     = "my-app"
+        NAMESPACE    = "test-environment"
+        GIT_REPO     = "git@github.com/org/dev-repo.git"
+    }
+
+    triggers {
+        // Initiate build when code is pushed to git dev repo
+        pollSCM('H/5 * * * *') 
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'development', url: "${env.GIT_REPO}"
+            }
+        }
+
+        stage('Build & Test') {
+            steps {
+                // Run Maven build and tests
+                sh "mvn clean install"
+            }
+            post {
+                always {
+                    junit '**/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Dockerize') {
+            steps {
+                script {
+                    // Build image for Docker containerization
+                    sh "docker build -t ${REGISTRY_URL}/${IMAGE_NAME}:${BUILD_NUMBER} ."
+                }
+            }
+        }
+
+        stage('Helm Chart Prep') {
+            steps {
+                dir('charts/my-app') {
+                    // Resolve Helm dependencies (e.g., database subcharts)
+                    sh "helm dependency update"
+                    sh "helm lint"
+                }
+            }
+        }
+
+        stage('Push to Marketplace') {
+            steps {
+                // Deploy the image to proprietary Marketplace registry
+                withCredentials([usernamePassword(credentialsId: 'registry-creds', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                    sh "echo $PASS | docker login ${REGISTRY_URL} -u $USER --password-stdin"
+                    sh "docker push ${REGISTRY_URL}/${IMAGE_NAME}:${BUILD_NUMBER}"
+                }
+            }
+        }
+
+        stage('OpenShift Provisioning') {
+            steps {
+                // Run Ansible Playbook for environment prep (as requested)
+                // This ensures the OpenShift namespace/configs are ready
+                ansiblePlaybook(
+                    playbook: 'ansible/openshift_setup.yml',
+                    inventory: 'ansible/inventory.ini'
+                )
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                // Use Helm to deploy 2 replicas (containers)
+                sh """
+                helm upgrade --install ${APP_NAME} ./charts/my-app \
+                --namespace ${NAMESPACE} \
+                --set image.repository=${REGISTRY_URL}/${IMAGE_NAME} \
+                --set image.tag=${BUILD_NUMBER} \
+                --set replicaCount=2
+                """
+            }
+        }
+    }
+}
